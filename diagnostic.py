@@ -183,7 +183,7 @@ class CycleDiagnostic:
                 return await llm_client._call(
                     [{"role": "system", "content": sys_prompt},
                      {"role": "user", "content": report}],
-                    manifold={"temperature": 1.0, "top_p": 0.95, "min_p": 0.01, "top_k": 40, "max_tokens": 600, "repetition_penalty": 0},
+                    manifold={"temperature": 1.0, "top_p": 0.95, "min_p": 0.01, "top_k": 40, "repetition_penalty": 0, "max_tokens": 600},
                     label="diagnostic"
                 )
             except Exception as e:
@@ -203,8 +203,8 @@ class CycleDiagnostic:
                     "top_p": 0.95,
                     "min_p": 0.01,
                     "top_k": 40,
-                    "max_tokens": 6300,
                     "repetition_penalty": 0,
+                    "max_tokens": 600, 
                     "stream": False
                 }
                 async with aiohttp.ClientSession() as session:

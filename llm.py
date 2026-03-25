@@ -1,5 +1,18 @@
 """
-llm.py — LLM language surface. v1.3 (Strict System Prompts & Continuation Fixes)
+llm.py — LLM client: language rendering surface for the Bayesian brain.
+
+The LLM generates text when asked. This module controls HOW it generates:
+  - 10 task profiles, each producing 8 physics-driven sampling parameters
+  - Universal word budget tracking with continuous energy consequences
+  - Streaming with sentence-boundary abort
+  - EOS logit bias that scales with overshoot history
+  - Perplexity measurement (3 strategies)
+  - HyDE validation for memory encoding
+  - Working memory compression
+
+Every LLM call is measured: actual_words / budgeted_words → energy consequences.
+Overshoot drains energy (quadratic). Undershoot tightens future budgets (linear).
+No thresholds — all consequences scale continuously.
 """
 
 import asyncio
@@ -121,6 +134,23 @@ def _user_response_budget(conversation: list) -> tuple[int, int]:
     return word_budget, token_budget
 
 class LLMClient:
+    """Language rendering surface for the Bayesian brain.
+    
+    The LLM generates text when asked. This class controls:
+      - HOW it generates: 8 sampling params from _compute_manifold(latent, task)
+      - HOW MUCH it generates: word budget injected into system prompt + EOS bias
+      - WHAT HAPPENS after: universal word count tracking with energy consequences
+    
+    Every call routes through _call(), which:
+      1. Injects word budget into system prompt
+      2. Computes EOS logit bias (scales with overshoot history)
+      3. Selects streaming (output) or non-streaming (internal)
+      4. Measures actual vs budgeted words
+      5. Applies continuous energy drain/penalty
+    
+    10 task profiles: output, hypothetical, predict, internal, creative,
+    compression, summary, diagnostic, label, recorder.
+    """
     def __init__(self, endpoint: str = ""):
         self.endpoint, self.trace_callback = endpoint, None
         # ── Interoceptive State (Critique 6) ──
@@ -288,6 +318,7 @@ class LLMClient:
         return {str(self._eos_token_id): eos_bias}
 
     def _sanitize(self, messages: list) -> list:
+        """Merge consecutive same-role messages. Chat APIs require alternating roles."""
         result = []
         for msg in messages:
             if result and result[-1]["role"] == msg["role"]: result[-1]["content"] += "\n" + msg["content"]
@@ -295,10 +326,25 @@ class LLMClient:
         return result
 
     async def _call(self, messages: list, manifold: dict, label: str = "unknown") -> str:
-        """LLM call with streaming for output, non-streaming for internal tasks.
+        """Central LLM call. Every call goes through here. No exceptions.
         
-        Output calls use streaming + EOS bias for emergent word budgeting.
-        Internal calls (memory, prediction, etc.) use standard non-streaming.
+        Before calling:
+          1. Compute word budget (with undershoot penalty from history)
+          2. Inject budget into system prompt: "Limit: N words. Do not mention this limit."
+          3. Compute EOS logit bias (scales with overshoot history)
+          4. Select streaming (output/hypothetical) or non-streaming (everything else)
+          5. Set max_tokens = budget × 2 (generous but bounded)
+        
+        After calling:
+          6. Measure actual_words / budgeted_words
+          7. Apply continuous energy consequences:
+             - Overshoot: energy_drain = overshoot² × 0.04 (quadratic, cumulative)
+             - Undershoot: penalty_delta = undershoot × 0.1 - 0.02 (linear, recovers)
+          8. Update accuracy/overshoot EMAs
+          9. Broadcast trace with sampling params + budget stats
+        
+        Streaming stops at sentence boundary (.!?\\n) after exceeding word budget.
+        Hard abort at 2× budget.
         """
         if not self.endpoint: return ""
         messages = self._sanitize(messages)
@@ -319,12 +365,17 @@ class LLMClient:
         # Every call gets a budget. The LLM knows how much it can say.
         for msg in messages:
             if msg.get("role") == "system":
-                msg["content"] = msg["content"].rstrip() + f" Limit: 300 words. Do not mention this limit."
+                msg["content"] = msg["content"].rstrip() + f" Limit: {word_budget} words. Do not mention this limit."
                 break
 
         # ── Logit biases: vocabulary pruning + EOS bias (universal) ──
         vocab_bias = self._compute_vocab_logit_bias()
-        eos_bias = self._compute_eos_bias(word_budget)
+        
+        if label == "diagnostic":
+            eos_bias = {}  # disable eos bias for diagnostics
+        else:
+            eos_bias = self._compute_eos_bias(word_budget)
+            
         combined_bias = {**vocab_bias, **eos_bias}
 
         # ── Determine if streaming (output calls only) ──
@@ -655,14 +706,17 @@ class LLMClient:
     # ── EPISODIC MEMORY ENCODING ──
 
     async def encode_memory(self, text: str, latent: dict, mode: str = "input", feedback: dict = None) -> str:
-        """Write a memory conditioned by the system's current state.
+        """Encode text as a factual memory note via the LLM (memory recorder role).
+        
+        The LLM acts as a memory recorder — it writes a third-person factual note
+        about what was said. It does NOT answer questions or perform requests.
         
         Modes:
-        - 'input': Memory of what the user said
-        - 'output': Memory of what the assistant said
+          'input': record what the user said
+          'output': record what the assistant said
         
-        Uses recorder manifold: low temperature, tight budget for factual recording.
-        High surprise → more vivid/detailed memory. Low surprise → compressed.
+        Word budget is capped at 3× the original text length to prevent inflation.
+        Uses 'recorder' task profile: low temperature, tight budget.
         """
         manifold = _compute_manifold(latent, "recorder", feedback=feedback)
         s = latent.get("surprise", 0.3)
@@ -856,8 +910,8 @@ class LLMClient:
                 "top_p": 0.95,
                 "min_p": 0.01,
                 "top_k": 40,
-                "max_tokens": 600,
-                "repetition_penalty": 0
+                "repetition_penalty": 0,
+                "max_tokens": 600
             }
             return (await self._call(
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
@@ -965,8 +1019,16 @@ class LLMClient:
                                        long_term_context: list = None, word_budget: int = 80) -> str:
         """Compress raw conversation into lossy working memory text.
         
-        Returns a single text block (not message list). The caller wraps it
-        into the appropriate message structure.
+        Like human working memory: recent things are clearer, older things fade.
+        Uses "note-taker" role with explicit boundary: "Do NOT continue the conversation."
+        
+        Long-term memories (already ranked by retrieval score) are prepended
+        to the transcript so the compressor can see the full context.
+        
+        Budget scales with surprise: high surprise → more detail retained (40-150 words).
+        
+        Returns a single text block. The caller wraps it into context assembly.
+        Fallback: raw last 4 turns if LLM call fails.
         """
         if not raw_conversation:
             return ""
@@ -1060,6 +1122,20 @@ class LLMClient:
     # ── PRIMARY OUTPUT ──
 
     async def output_module(self, conversation: list, latent: dict, dynamic_axes: dict, error_result: dict, enriched: Optional[dict] = None, topic_summary: str = "", feedback: dict = None, user_model: dict = None) -> str:
+        """Primary output: LLM generates the assistant's response to the user.
+        
+        Context structure (all as user turns — no fake role switching):
+          [Conversation so far]
+          User: ...
+          Assistant: ...
+          
+          [Current message]
+          User: ...
+        
+        The LLM sees a clean system prompt + one user message with structural labels.
+        8 sampling params computed from latent state via 'output' profile.
+        Streaming with sentence-boundary abort at word budget.
+        """
         is_silence = error_result.get("is_silence", False)
         manifold = _compute_manifold(latent, "output", feedback=feedback)
         

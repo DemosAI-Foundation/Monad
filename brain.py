@@ -1,5 +1,24 @@
 """
-brain.py — Bayesian Brain. v1.1.1 (Causal Impact Fix)
+brain.py — Bayesian Brain: predictive coding conversational agent.
+
+Core processing engine. Implements a 14-step pipeline per user message:
+  1. Encode (vector + affect + intent)
+  2. Predictive error (compare prediction with actual input)
+  3. Affective bleed + episodic recall (memory → latent state)
+  4. Affective prediction error (valence/arousal mismatch)
+  5. Lexical error (LLM perplexity on input)
+  6. Error composition (hierarchical blend: semantic > lexical > cosine)
+  7. Precision weighting (coherence × intent consistency × lexical precision)
+  8. Kalman update (3D latent state with diagonal covariance)
+  9. Allostatic regulation + memory encoding
+  10. Context assembly (working memory compression + long-term retrieval)
+  11. Pre-action trajectory prediction
+  12. Output generation + post-action analysis
+  13. Causal relevance scoring (did memories help or hurt?)
+  14. Cycle diagnostic (full trace dump + LLM interpretation)
+
+The LLM is a tool — all cognition happens in vector space via Kalman filtering.
+Latent state: (surprise ∈ [0,1], valence ∈ [-1,+1], velocity ∈ [0,1]).
 """
 
 import asyncio
@@ -239,9 +258,25 @@ def idle_phase(seconds: int) -> dict:
 # ── Main Class ──
 
 class BayesianBrain:
-    PROCESS_NOISE = [0.01, 0.005, 0.01]  # Q for Kalman
-    N_PROTOTYPES = 8
-    PROTOTYPE_SIGMA = 0.3
+    """Predictive coding conversational agent.
+    
+    Maintains a 3D latent state (surprise, valence, velocity) updated via
+    Kalman filtering. The LLM is a language rendering surface — all cognition
+    happens in vector space.
+    
+    Key state:
+      latent: current 3D state (surprise ∈ [0,1], valence ∈ [-1,+1], velocity ∈ [0,1])
+      _P: diagonal Kalman covariance [P_surprise, P_valence, P_velocity]
+      phenotype_prior: adaptive baseline — drifts under chronic stress (allostatic load)
+      free_energy_val: KL(posterior ∥ prior) + prediction error
+      conversation: raw message buffer for perplexity + context assembly
+    
+    Idle behavior: Langevin dynamics on potential landscape with memory attractors,
+    covariance inflation (P = P + Q), dream synthesis, memory compression.
+    """
+    PROCESS_NOISE = [0.01, 0.005, 0.01]  # Q for Kalman: uncertainty growth per cycle
+    N_PROTOTYPES = 8      # self-model prototype count
+    PROTOTYPE_SIGMA = 0.3 # prototype activation width
 
     def __init__(self):
         self.latent: dict = initial_latent()
@@ -485,9 +520,27 @@ class BayesianBrain:
     async def _encode_and_store_memory(self, text: str, latent: dict, llm, memory, vectors, broadcast,
                                         mode: str = "input", error: float = 0.5, precision: float = 1.0,
                                         feedback: dict = None, raw_preview: str = "") -> str:
-        """Encode a memory, check VAD alignment, retry once if needed, store everywhere.
-        mode: 'input' for user messages, 'output' for assistant replies.
-        Returns the memory text, or empty string on failure."""
+        """Encode text into long-term episodic memory via LLM + vector store.
+        
+        Pipeline:
+          1. LLM encodes text as factual note (recorder role, tight budget)
+          2. Embed the note → 384d vector
+          3. Check VAD alignment (does the note match the source affect?)
+          4. If alignment < 0.35, retry once with fresh LLM call
+          5. Compute encoding strength: f(prediction_error, precision, arousal)
+          6. Apply repetition suppression (similar recent memories → reduced strength)
+          7. Apply primacy effect (first-cycle memories get boosted)
+          8. Store in ChromaDB + SQLite with full metadata
+        
+        Args:
+            text: raw text to encode (may include commitment binding context)
+            mode: 'input' for user messages, 'output' for assistant replies
+            error: current prediction error (drives encoding strength)
+            precision: current precision weight (modulates encoding strength)
+            raw_preview: original user text for trace display
+            
+        Returns: the encoded memory text, or empty string on failure.
+        """
         
         for attempt in range(2):
             mem_text = await llm.encode_memory(text, latent, mode=mode, feedback=feedback)
@@ -1027,6 +1080,19 @@ class BayesianBrain:
             await broadcast({"type": "idle_tick", "data": self.state_snapshot()})
 
     async def process_input(self, user_text: str, llm: Any, memory: Any, broadcast: Callable, vectors: Any = None, origin: str = "user"):
+        """Main 14-step processing pipeline. See module docstring for full pipeline description.
+        
+        Each step broadcasts trace events via WebSocket for real-time diagnostics.
+        All trace events are also collected by CycleDiagnostic for end-of-cycle analysis.
+        
+        Args:
+            user_text: raw user input
+            llm: LLMClient instance (language rendering surface)
+            memory: Memory instance (SQLite persistence)
+            broadcast: async function to send WebSocket messages
+            vectors: EmbeddingStore instance (vector space operations)
+            origin: 'user' for real input, 'idle' for DMN-generated input
+        """
         if self.is_processing and origin == "user": return
         if origin == "user": self.reset_idle()
         self.is_processing = True

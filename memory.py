@@ -1,5 +1,13 @@
 """
-memory.py — SQLite persistence. v1.0
+memory.py — SQLite persistence layer.
+
+Stores all durable state across sessions:
+  - Conversation history (user + assistant messages)
+  - Episodic memories (with encoding strength, valence, recall count)
+  - Brain state (latent, covariance, phenotype prior, EMAs)
+  - Predictions and their accuracy
+  - Concept uncertainty tracking
+  - Latent state log for visualization
 """
 
 import aiosqlite

@@ -1,5 +1,18 @@
 """
-embeddings.py — Full vector encoding layer. v1.1 (Empirical Physics)
+embeddings.py — Vector encoding layer for the Bayesian brain.
+
+Handles all vector-space operations:
+  - sentence-transformers (all-MiniLM-L6-v2) for 384d embeddings
+  - ChromaDB for episodic memory storage and retrieval
+  - Dual-track retrieval: semantic similarity + temporal recency injection
+  - Entropy-based memory decay (interference, not Ebbinghaus)
+  - Boredom-driven class weighting (DMN activation)
+  - Epistemic foraging via covariance inflation (trace(P) > threshold)
+  - VAD affective model (valence, arousal, dominance)
+  - Intent classification via cosine distance to action anchors
+  - Encoding strength: f(prediction_error, precision, arousal)
+
+Memory scoring: score = semantic_sim × exp(-turns × 0.3) × encoding_strength
 """
 
 import asyncio
@@ -188,6 +201,19 @@ class VADModel:
         except Exception: return None
 
 class EmbeddingStore:
+    """Vector space operations for the Bayesian brain.
+    
+    Manages:
+      - ChromaDB collections: episodic memories, messages, concepts, beliefs
+      - sentence-transformers embedding model (384d)
+      - VAD affective model for valence/arousal scoring
+      - Intent and action classification via cosine distance to anchor vectors
+      - Dual-track retrieval: semantic similarity + temporal recency injection
+      - Encoding strength computation: f(prediction_error, precision, arousal)
+      - Boredom-driven class weighting during retrieval (DMN activation)
+      - Epistemic foraging via covariance-driven exploration
+      - Reconsolidation tracking (how recalled memories drift over time)
+    """
     def __init__(self, embed_model=EMBED_MODEL, chroma_path=CHROMA_PATH):
         self._embed_model_name = embed_model
         self._chroma_path = chroma_path

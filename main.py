@@ -1,5 +1,15 @@
 """
-main.py — FastAPI application. v1.0
+main.py — FastAPI server + WebSocket hub.
+
+Startup lifecycle:
+  1. Initialize SQLite (memory.py)
+  2. Initialize ChromaDB + sentence-transformers (embeddings.py)
+  3. Restore brain state from persistence
+  4. Wire LLM trace callback to WebSocket broadcast
+  5. Start idle loop (Langevin dynamics)
+
+All user input arrives via WebSocket, passes through brain.process_input(),
+and results stream back as JSON messages (chat, traces, state updates).
 """
 
 import asyncio
