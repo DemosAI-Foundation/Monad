@@ -496,6 +496,177 @@ class BayesianBrain:
             logger.debug(f"Encoded memory retrieval failed: {e}")
             return []
 
+    # ── Active Inference: Policy Selection via Expected Free Energy ──
+
+    def evaluate_policies(self, energy: float, current_error: float = 0.5) -> dict:
+        """Score candidate policies via Expected Free Energy (Friston 2017).
+        
+        G(π) = pragmatic_value + epistemic_value + energy_cost
+        
+        Pragmatic: how far does this policy move us from preferred state?
+        Epistemic: how much will this policy reduce uncertainty (trace(P))?
+        Energy: metabolic cost of executing the policy.
+        
+        Returns: {G: {policy: score}, probs: {policy: prob}, selected: str}
+        No LLM calls. Pure math from existing state variables.
+        """
+        trace_P = sum(self._P)
+        efe_dist = efe_distance(self.latent, self.phenotype_prior)
+        n_attractors = len(getattr(self, '_idle_attractors', []))
+        fe = self.free_energy_val
+        
+        # ── G(respond): full pipeline → output to user ──
+        # High pragmatic value (moves toward preferred state via engagement)
+        # High epistemic value (full cycle with observation → P shrinks)  
+        # High energy cost (8-10 LLM calls)
+        G_respond = (
+            -efe_dist * 0.8             # pragmatic: responding helps reach preferred state
+            - trace_P * 0.6             # epistemic: full cycle resolves ~60% uncertainty
+            + (1.0 - energy) * 0.3      # cost: expensive when tired
+            + current_error * 0.1       # slight penalty: high error = maybe not ready to respond
+        )
+        
+        # ── G(think): run hypothetical, feed back as observation, no output ──
+        # Low pragmatic value (no direct user satisfaction)
+        # Medium-high epistemic value (imagined observation → partial P reduction)
+        # Low energy cost (0 extra LLM calls — reuses existing hypothetical)
+        G_think = (
+            -efe_dist * 0.2             # pragmatic: thinking indirectly improves future responses
+            - trace_P * 0.4             # epistemic: imagination resolves ~40% uncertainty
+            - n_attractors * 0.08       # bonus: more unresolved tensions → thinking helps more
+            + (1.0 - energy) * 0.03     # cost: very cheap (no new LLM calls)
+        )
+        
+        # ── G(recall): forage episodic memory, reconsolidate ──
+        # No pragmatic value (no output)
+        # High epistemic value when many unresolved attractors
+        # Very low energy cost
+        G_recall = (
+            0.0                                                      # pragmatic: zero
+            - trace_P * 0.25 * n_attractors / max(n_attractors, 1)   # epistemic: scales with unresolved count
+            + 0.01                                                   # cost: near-zero
+        )
+        
+        # ── G(silence): do nothing, let P inflate naturally ──
+        # Pragmatic value depends on distance: near preferred = silence is fine
+        # Zero epistemic value
+        # Negative cost (energy recovery)
+        G_silence = (
+            efe_dist * 0.6              # pragmatic: BAD when far from preferred (need to act)
+            - 0.0                       # epistemic: zero information gain
+            - 0.02                      # benefit: energy recovery
+        )
+        
+        G = {"respond": round(G_respond, 4), "think": round(G_think, 4), 
+             "recall": round(G_recall, 4), "silence": round(G_silence, 4)}
+        
+        # Softmax selection: P(π) ∝ exp(-β × G(π))
+        # Precision β scales with confidence — high precision = more decisive
+        beta = max(0.5, getattr(self, '_last_precision', 1.0) * 2.0)
+        
+        min_G = min(G.values())
+        weights = {k: math.exp(-beta * (v - min_G)) for k, v in G.items()}
+        total = sum(weights.values())
+        probs = {k: round(w / total, 4) for k, w in weights.items()}
+        
+        selected = min(G, key=G.get)
+        
+        return {
+            "G": G, "probs": probs, "selected": selected,
+            "trace_P": round(trace_P, 4), "efe_dist": round(efe_dist, 4),
+            "n_attractors": n_attractors, "energy": round(energy, 4),
+            "beta": round(beta, 4),
+        }
+
+    async def _execute_think(self, hyp_text: str, hyp_vec: list, 
+                              latent: dict, vectors, broadcast) -> dict:
+        """Execute the 'think' policy: feed hypothetical reply as imagined observation.
+        
+        No new LLM calls. Takes the already-generated hypothetical from step 11,
+        measures its affective properties, and creates a low-precision Kalman 
+        observation. Uncertainty shrinks because the system processed information 
+        internally, even though nothing was communicated to the user.
+        
+        Returns: updated (latent, P, free_energy) after internal Kalman update.
+        """
+        if not hyp_text or not hyp_vec or not vectors:
+            return {"latent": latent, "P": self._P, "fe": self.free_energy_val}
+        
+        # Measure affective properties of the imagined response
+        thought_valence, thought_arousal, _ = await vectors._score_vad_text(hyp_text, hyp_vec)
+        
+        # Compute velocity WITHOUT mutating the embed_window
+        # (imagined content should not pollute real velocity tracking)
+        window = list(vectors._embed_window)
+        if window:
+            last_real = window[-1]
+            thought_velocity = min(1.0, (1.0 - sum(a*b for a,b in zip(hyp_vec, last_real))) / 0.45)
+        else:
+            thought_velocity = 0.3
+        
+        # The imagined observation:
+        # - Low surprise (we generated it — it's consistent with our model)
+        # - Valence/velocity from the hypothetical content
+        obs_surprise = 0.1  # imagined content is not surprising
+        obs_valence = thought_valence
+        obs_velocity = thought_velocity
+        
+        # Lower precision for imagined observations (less trustworthy than real input)
+        # Real observations use precision ~1.0-1.25, imagined use ~0.5
+        think_precision = 0.5
+        
+        # Kalman update with imagined observation
+        new_latent, new_P, eff_gain, breakdown = update_latent(
+            latent, obs_surprise, obs_valence, obs_velocity,
+            precision=think_precision, P=list(self._P), Q=[0.0, 0.0, 0.0]  # no process noise for internal step
+        )
+        
+        # Update system state
+        self._P = new_P
+        new_fe = compute_free_energy(
+            self.rolling_error, new_latent, self.phenotype_prior, self._P)
+        
+        await broadcast({
+            "type": "system_trace", "label": "think_action", "duration_ms": 0,
+            "summary": f"Internal thought: P [{self._P[0]:.3f},{self._P[1]:.3f},{self._P[2]:.3f}] → FE {new_fe:.3f}",
+            "details": {
+                "thought_valence": round(thought_valence, 3),
+                "thought_velocity": round(thought_velocity, 3),
+                "observation": {"surprise": obs_surprise, "valence": obs_valence, "velocity": obs_velocity},
+                "precision": think_precision,
+                "P_before": [round(p, 4) for p in self._P],
+                "P_after": new_P,
+                "gain": breakdown,
+                "thought_preview": hyp_text[:100],
+            }
+        })
+        
+        # Log JEPA data: (V_t, action="think", V_{t+1})
+        try:
+            import json as _json
+            with open("jepa_training_data.jsonl", "a") as f:
+                f.write(_json.dumps({
+                    "V_t": [latent["surprise"], latent["valence"], latent["velocity"]],
+                    "action": "think",
+                    "action_vec": hyp_vec[:32] if hyp_vec else [],
+                    "V_t1": [new_latent["surprise"], new_latent["valence"], new_latent["velocity"]],
+                }) + "\n")
+        except Exception:
+            pass
+        
+        return {"latent": new_latent, "P": new_P, "fe": new_fe}
+
+    async def _execute_recall(self, vectors, memory, broadcast) -> bool:
+        """Execute the 'recall' policy: forage episodic memory mid-pipeline.
+        Reuses existing _unresolved_attractor logic. Returns True if memories were found."""
+        if not vectors:
+            return False
+        try:
+            await self._unresolved_attractor(vectors, memory, broadcast)
+            return len(getattr(self, '_idle_attractors', [])) > 0
+        except Exception:
+            return False
+
     @property
     def rolling_error(self) -> float:
         """Exponentially-weighted recent prediction error. Recency-biased: recent errors matter more."""
@@ -1896,18 +2067,77 @@ class BayesianBrain:
             self._predicted_hyp_vec = vec_pre
             self._predicted_hyp_text = pre_action_pred
 
-            # ── 12. OUTPUT ──────────
-            reply = await llm.output_module(
-                conversation=_mc, 
-                latent=new_latent, 
-                dynamic_axes=self.dynamic_axes, 
-                error_result=pred_err, 
-                enriched=enriched, 
-                topic_summary=self.topic_summary, 
-                feedback=feedback,
-                user_model=vectors.get_user_model() if vectors else {},
-                state_conditioning=self.stage_uses_state("output"),
-            )
+            # ── 11b. POLICY SELECTION (Active Inference via Expected Free Energy) ──
+            # Evaluate candidate policies: respond, think, recall, silence
+            # Think = feed hypothetical as imagined Kalman observation (no new LLM calls)
+            # Recall = forage episodic memory for unresolved tensions
+            # Silence = skip output, let covariance inflate
+            # Respond = full output generation (current default)
+            # The loop allows chaining: think → re-evaluate → maybe think again → respond
+            
+            MAX_THINK_ITERS = 3
+            selected_policy = "respond"  # default if policy eval fails
+            policy_trace = []
+            
+            for think_iter in range(MAX_THINK_ITERS + 1):
+                policy = self.evaluate_policies(energy=energy, current_error=current_error)
+                selected_policy = policy["selected"]
+                policy_trace.append({"iter": think_iter, "selected": selected_policy, **policy})
+                
+                await broadcast({
+                    "type": "system_trace", "label": "policy_selection", "duration_ms": 0,
+                    "summary": f"Policy: {selected_policy.upper()} (iter {think_iter}) | G: {' '.join(f'{k}={v:.3f}' for k,v in policy['G'].items())}",
+                    "details": policy
+                })
+                
+                if selected_policy == "think" and think_iter < MAX_THINK_ITERS:
+                    # ── THINK: feed hypothetical as imagined observation ──
+                    # Reuses the hypothetical already generated in step 11
+                    # No new LLM calls — pure Kalman update with reduced precision
+                    if self._predicted_hyp_text and self._predicted_hyp_vec:
+                        think_result = await self._execute_think(
+                            self._predicted_hyp_text, self._predicted_hyp_vec,
+                            new_latent, vectors, broadcast)
+                        new_latent = think_result["latent"]
+                        self.latent = new_latent
+                        self.free_energy_val = think_result["fe"]
+                    else:
+                        break  # no hypothetical to think about
+                    
+                elif selected_policy == "recall" and think_iter < MAX_THINK_ITERS:
+                    # ── RECALL: forage episodic memory ──
+                    found = await self._execute_recall(vectors, memory, broadcast)
+                    if not found:
+                        break  # nothing to recall, fall through to respond
+                    
+                else:
+                    # respond or silence — exit loop
+                    break
+
+            # ── 12. OUTPUT (or silence) ──────────
+            reply = ""
+            
+            if selected_policy == "silence":
+                # System chose not to respond — energy recovery, P will inflate next idle tick
+                await broadcast({
+                    "type": "system_trace", "label": "policy_silence", "duration_ms": 0,
+                    "summary": f"System chose SILENCE — EFE favored waiting",
+                    "details": {"policy_trace": policy_trace}
+                })
+                
+            else:
+                # respond (or fallback from think/recall that didn't resolve)
+                reply = await llm.output_module(
+                    conversation=_mc, 
+                    latent=new_latent, 
+                    dynamic_axes=self.dynamic_axes, 
+                    error_result=pred_err, 
+                    enriched=enriched, 
+                    topic_summary=self.topic_summary, 
+                    feedback=feedback,
+                    user_model=vectors.get_user_model() if vectors else {},
+                    state_conditioning=self.stage_uses_state("output"),
+                )
 
             # ── 12a. ENCODE OUTPUT MEMORY ──────────
             output_memory = ""
