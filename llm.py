@@ -191,6 +191,7 @@ class LLMClient:
 
     @property
     def interoceptive_state(self) -> dict:
+        """Current metabolic state: energy, call counts, latency, budget accuracy."""
         return {
             "energy": self.energy,
             "cycle_calls": self._cycle_calls,
@@ -202,6 +203,7 @@ class LLMClient:
         }
 
     async def test_connection(self) -> bool:
+        """Check if LLM endpoint is reachable. Initializes EOS token and vocab pruning on first success."""
         if not self.endpoint: return False
         for path in ["/health", "/v1/models"]:
             try:
@@ -351,7 +353,7 @@ class LLMClient:
         t0 = time.monotonic()
         
         energy = self.energy
-        # Bypass energy temp damping for diagnostic calls
+        # Bypass energy temp damping for output and diagnostic calls
         if energy < 0.5 and label not in ("output", "diagnostic"):
             manifold = dict(manifold)
             manifold["temperature"] = round(manifold.get("temperature", 0.7) * (0.6 + energy * 0.4), 3)
@@ -370,12 +372,7 @@ class LLMClient:
 
         # ── Logit biases: vocabulary pruning + EOS bias (universal) ──
         vocab_bias = self._compute_vocab_logit_bias()
-        
-        if label == "diagnostic":
-            eos_bias = {}  # disable eos bias for diagnostics
-        else:
-            eos_bias = self._compute_eos_bias(word_budget)
-            
+        eos_bias = self._compute_eos_bias(word_budget)
         combined_bias = {**vocab_bias, **eos_bias}
 
         # ── Determine if streaming (output calls only) ──
@@ -397,9 +394,6 @@ class LLMClient:
             "stream": use_stream,
         }
         
-        if "top_k" in manifold:
-            payload["top_k"] = manifold["top_k"]
-            
         dynatemp = manifold.get("dynatemp_range", 0.0)
         if dynatemp > 0:
             payload["dynatemp_range"] = dynatemp
@@ -513,7 +507,6 @@ class LLMClient:
                     "temperature": payload["temperature"],
                     "top_p": payload["top_p"],
                     "min_p": payload.get("min_p", 0.05),
-                    "top_k": payload.get("top_k"),
                     "presence_penalty": payload.get("presence_penalty", 0.0),
                     "frequency_penalty": payload.get("frequency_penalty", 0.0),
                     "repetition_penalty": payload.get("repetition_penalty", 1.0),
@@ -667,6 +660,8 @@ class LLMClient:
     # ── LOGICAL / BACKGROUND TASKS (STRICT SYSTEM PROMPTING) ──
 
     async def reconcile_epistemic_conflict(self, concept: str, web_data: str, latent: dict, vectors) -> dict:
+        """Reconcile conflict between the LLM's innate knowledge and external web data.
+        Computes semantic + statistical conflict, then merges/overrides/balances accordingly."""
         t0 = time.monotonic()
         sys_man = _compute_manifold(latent, "internal")
         
@@ -864,6 +859,7 @@ class LLMClient:
             return ""
 
     async def topic_summary_module(self, recent_turns: list, latent: dict) -> str:
+        """Generate a 1-2 sentence topic summary of the recent conversation for context."""
         sys_prompt = f"{_state_conditioning(latent)}\nYou are the Context Summarization Module."
         turns_text = "\n".join([f"{t['role'].upper()}: {t['content'][:200]}" for t in recent_turns[-4:]])
         user_prompt = f"Recent conversation:\n{turns_text}\n\nIn 1-2 sentences, describe what this conversation has been about. Plain language."
@@ -905,13 +901,11 @@ class LLMClient:
             f"In 2-4 sentences: What happened this cycle? Are any recall patterns concerning? What should the system attend to next?"
         )
         try:
+            # Static manifold — diagnostic needs consistent, unconstrained generation
+            # regardless of system state (high temp + wide nucleus for thorough analysis)
             static_manifold = {
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "min_p": 0.01,
-                "top_k": 40,
-                "repetition_penalty": 0,
-                "max_tokens": 600
+                "temperature": 1.0, "top_p": 0.95, "min_p": 0.01,
+                "top_k": 40, "max_tokens": 600, "repetition_penalty": 0
             }
             return (await self._call(
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}],
@@ -923,36 +917,25 @@ class LLMClient:
 
     # ── PREDICTION TASKS ──
 
-    async def predict_trajectory(self, conversation: list, latent: dict, user_model: dict = None) -> str:
-        """Pre-Action Prediction: 
-        1. Generate a hypothetical assistant response.
-        2. Predict the user's next message."""
+    async def predict_trajectory(self, conversation: list, latent: dict, user_model: dict = None, state_conditioning: bool = False) -> str:
+        """Pre-Action Prediction: generate hypothetical reply, then predict user's next message."""
         s, v, vel = latent.get("surprise", 0.3), latent.get("valence", 0.0), latent.get("velocity", 0.3)
 
         # ── Step 1: Generate hypothetical assistant response ──
         hyp_manifold = _compute_manifold(latent, "hypothetical")
         
-        # Build context with clear current message
-        history_lines = []
-        current_user_msg = ""
+        # Build context — serialize whatever the resolver provided
+        context_lines = []
         for m in conversation[-4:]:
             role = "User" if m.get("role") == "user" else "Assistant"
-            line = f"{role}: {m.get('content', '')[:300]}"
-            history_lines.append(line)
+            context_lines.append(f"{role}: {m.get('content', '')[:300]}")
         
-        # Last entry should be the current user message
-        if history_lines:
-            current_user_msg = history_lines.pop()
-        
-        hyp_prompt = ""
-        if history_lines:
-            hyp_prompt = f"[Conversation]\n" + "\n\n".join(history_lines) + f"\n\n[Respond to this]\n{current_user_msg}"
-        else:
-            hyp_prompt = current_user_msg
+        hyp_sys = _state_conditioning(latent) + "\n" if state_conditioning else ""
+        hyp_sys += "You are an AI assistant. Respond to the user's latest message."
         
         messages = [
-            {"role": "system", "content": "You are an AI assistant. Respond to the user's latest message."},
-            {"role": "user", "content": hyp_prompt}
+            {"role": "system", "content": hyp_sys},
+            {"role": "user", "content": "\n\n".join(context_lines)}
         ]
 
         try:
@@ -973,12 +956,17 @@ class LLMClient:
             full_lines.append(f"{role}: {m.get('content', '')[:300]}")
         full_lines.append(f"Assistant: {hypothetical_reply[:300]}")
         
+        pred_sys = ""
+        if state_conditioning:
+            pred_sys = _state_conditioning(latent) + "\n"
+        pred_sys += (
+            "You are predicting what the USER will say next. "
+            "Read the conversation below and write the user's likely next message. "
+            "Output ONLY what the user would say — not what the assistant would say."
+        )
+        
         pred_messages = [
-            {"role": "system", "content": (
-                "You are predicting what the USER will say next. "
-                "Read the conversation below and write the user's likely next message. "
-                "Output ONLY what the user would say — not what the assistant would say."
-            )},
+            {"role": "system", "content": pred_sys},
             {"role": "user", "content": "\n\n".join(full_lines)}
         ]
 
@@ -988,23 +976,27 @@ class LLMClient:
         except Exception:
             return ""
 
-    async def predicted_input_module(self, conversation: list, latent: dict, actual_output: str, user_model: dict = None) -> str:
+    async def predicted_input_module(self, conversation: list, latent: dict, actual_output: str, user_model: dict = None, state_conditioning: bool = False) -> str:
         """Post-Action Prediction: predict user's next message given what was just said."""
         manifold = _compute_manifold(latent, "predict", feedback=self._feedback)
 
-        # Build conversation + actual output
         context_lines = []
         for m in conversation[-3:]:
             role = "User" if m.get("role") == "user" else "Assistant"
             context_lines.append(f"{role}: {m.get('content', '')[:300]}")
         context_lines.append(f"Assistant: {actual_output[:300]}")
         
+        pred_sys = ""
+        if state_conditioning:
+            pred_sys = _state_conditioning(latent) + "\n"
+        pred_sys += (
+            "You are predicting what the USER will say next. "
+            "Read the conversation below and write the user's likely next message. "
+            "Output ONLY what the user would say — not what the assistant would say."
+        )
+        
         messages = [
-            {"role": "system", "content": (
-                "You are predicting what the USER will say next. "
-                "Read the conversation below and write the user's likely next message. "
-                "Output ONLY what the user would say — not what the assistant would say."
-            )},
+            {"role": "system", "content": pred_sys},
             {"role": "user", "content": "\n\n".join(context_lines)}
         ]
 
@@ -1015,29 +1007,28 @@ class LLMClient:
 
     # ── WORKING MEMORY COMPRESSION ──
 
-    async def compress_working_memory(self, raw_conversation: list, latent: dict, 
-                                       long_term_context: list = None, word_budget: int = 80) -> str:
-        """Compress raw conversation into lossy working memory text.
+    async def compress_working_memory(self, context_messages: list, latent: dict, 
+                                       word_budget: int = 80, state_conditioning: bool = False) -> str:
+        """Compress context messages into lossy working memory text.
         
-        Like human working memory: recent things are clearer, older things fade.
-        Uses "note-taker" role with explicit boundary: "Do NOT continue the conversation."
-        
-        Long-term memories (already ranked by retrieval score) are prepended
-        to the transcript so the compressor can see the full context.
-        
-        Budget scales with surprise: high surprise → more detail retained (40-150 words).
-        
-        Returns a single text block. The caller wraps it into context assembly.
-        Fallback: raw last 4 turns if LLM call fails.
+        Accepts generic [{role, content}] from pipeline resolver — could be
+        raw conversation, encoded memories, or any configured combination.
+        Returns a single text block. Caller assembles final context.
         """
-        if not raw_conversation:
+        if not context_messages:
             return ""
         
-        # Build raw transcript
+        # Build transcript from whatever the resolver provided
         lines = []
-        for m in raw_conversation[-12:]:
-            role = "User" if m.get("role") == "user" else "Assistant"
-            content = m.get("content", "")[:400]
+        for m in context_messages[-12:]:
+            if isinstance(m, dict):
+                role = "User" if m.get("role") == "user" else "Assistant"
+                content = m.get("content", "")[:400]
+            elif isinstance(m, str):
+                role = "User"
+                content = m[:400]
+            else:
+                continue
             if content.strip():
                 lines.append(f"{role}: {content}")
         
@@ -1045,25 +1036,20 @@ class LLMClient:
             return ""
         
         transcript = "\n".join(lines)
-        
-        # Add long-term memories ranked by retrieval score (already ranked)
-        if long_term_context:
-            lt_lines = []
-            for m in long_term_context[:4]:
-                role = "User" if m.get("role") == "user" else "Assistant"
-                lt_lines.append(f"{role}: {m.get('content', '')[:200]}")
-            if lt_lines:
-                transcript = "\n".join(lt_lines) + "\n\n" + transcript
-        
         manifold = _compute_manifold(latent, "compression", feedback=self._feedback)
+        
+        sys_parts = []
+        if state_conditioning:
+            sys_parts.append(_state_conditioning(latent))
+        sys_parts.append(
+            "You are a note-taker. Read the conversation transcript below and write a brief summary of what was discussed. "
+            "Include what the user asked and what the assistant replied. "
+            "Do NOT continue the conversation. Do NOT add new content. Just summarize what happened."
+        )
         
         try:
             compressed = await self._call(
-                [{"role": "system", "content": (
-                    "You are a note-taker. Read the conversation transcript below and write a brief summary of what was discussed. "
-                    "Include what the user asked and what the assistant replied. "
-                    "Do NOT continue the conversation. Do NOT add new content. Just summarize what happened."
-                )},
+                [{"role": "system", "content": "\n".join(sys_parts)},
                  {"role": "user", "content": f"TRANSCRIPT:\n{transcript}"}],
                 manifold=manifold, label="compress_working_memory"
             )
@@ -1071,11 +1057,12 @@ class LLMClient:
         except Exception:
             pass
         
-        # Fallback: raw last 4 turns
+        # Fallback: last 4 items as-is
         fallback = []
-        for m in raw_conversation[-4:]:
-            role = "User" if m.get("role") == "user" else "Assistant"
-            fallback.append(f"{role}: {m.get('content', '')[:150]}")
+        for m in context_messages[-4:]:
+            if isinstance(m, dict):
+                role = "User" if m.get("role") == "user" else "Assistant"
+                fallback.append(f"{role}: {m.get('content', '')[:150]}")
         return "\n".join(fallback)
 
     async def hyde_validate(self, memory_text: str, latent: dict = None) -> str:
@@ -1121,50 +1108,33 @@ class LLMClient:
 
     # ── PRIMARY OUTPUT ──
 
-    async def output_module(self, conversation: list, latent: dict, dynamic_axes: dict, error_result: dict, enriched: Optional[dict] = None, topic_summary: str = "", feedback: dict = None, user_model: dict = None) -> str:
-        """Primary output: LLM generates the assistant's response to the user.
+    async def output_module(self, conversation: list, latent: dict, dynamic_axes: dict, error_result: dict, enriched: Optional[dict] = None, topic_summary: str = "", feedback: dict = None, user_model: dict = None, state_conditioning: bool = False) -> str:
+        """Primary output: LLM generates the assistant's response.
         
-        Context structure (all as user turns — no fake role switching):
-          [Conversation so far]
-          User: ...
-          Assistant: ...
-          
-          [Current message]
-          User: ...
-        
-        The LLM sees a clean system prompt + one user message with structural labels.
-        8 sampling params computed from latent state via 'output' profile.
-        Streaming with sentence-boundary abort at word budget.
+        conversation is whatever the pipeline resolver assembled — could be
+        encoded memories only, WM + LT, raw conversation, or any combination.
+        We serialize it faithfully without assuming structure.
         """
         is_silence = error_result.get("is_silence", False)
         manifold = _compute_manifold(latent, "output", feedback=feedback)
         
-        sys_parts = ["You are an AI assistant."]
+        sys_parts = []
+        if state_conditioning:
+            sys_parts.append(_state_conditioning(latent))
+        sys_parts.append("You are an AI assistant.")
         if topic_summary: sys_parts.append(f"Topic: {topic_summary}")
         
-        messages = [{"role": "system", "content": " ".join(sys_parts)}]
+        messages = [{"role": "system", "content": "\n".join(sys_parts)}]
         
-        # Separate history from the current user message
-        # History = everything except the last user turn
-        # Current = the last user turn (what we're responding to)
-        history_parts = []
-        current_msg = ""
-        
+        # Serialize all resolved context into a single user turn
+        context_lines = []
         for msg in conversation:
             role = "User" if msg.get("role") == "user" else "Assistant"
             content = msg.get("content", "").strip()
             if content:
-                history_parts.append(f"{role}: {content}")
+                context_lines.append(f"{role}: {content}")
         
-        # The last user-role entry is the current message
-        if history_parts:
-            current_msg = history_parts.pop()  # remove last (current turn)
-        
-        # Build the prompt: history as context, current message as the actual request
-        if history_parts:
-            context = "\n\n".join(history_parts)
-            messages.append({"role": "user", "content": f"[Conversation so far]\n{context}\n\n[Current message]\n{current_msg}"})
-        elif current_msg:
-            messages.append({"role": "user", "content": current_msg})
+        if context_lines:
+            messages.append({"role": "user", "content": "\n\n".join(context_lines)})
             
         return await self._call(messages, manifold=manifold, label="output")

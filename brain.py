@@ -51,10 +51,41 @@ MAX_IDLE_FE        = 2.5
 # THE GENOTYPE
 BASE_PRIOR = {"surprise": 0.25, "valence": 0.30, "velocity": 0.40}
 
+# ── Pipeline Configuration ──
+# Defines which data sources feed into each pipeline function.
+# Modifiable at runtime via the PIPELINE tab in the UI.
+# Available sources:
+#   raw_conversation — actual chat turns from self.conversation
+#   encoded_inputs  — LLM-recorded user memory notes from ChromaDB
+#   encoded_outputs — LLM-recorded assistant memory notes from ChromaDB
+#   lt_memories     — semantically + temporally retrieved long-term memories
+#   working_memory  — compressed WM text (output of WM compression stage)
+#   current_message — the current user input text
+DEFAULT_PIPELINE_CONFIG = {
+    "working_memory":      {"sources": ["encoded_inputs", "encoded_outputs"], "state_conditioning": False},
+    "output":              {"sources": ["working_memory", "lt_memories", "current_message"], "state_conditioning": True},
+    "hypothetical":        {"sources": ["working_memory", "current_message"], "state_conditioning": True},
+    "predict_pre":         {"sources": ["working_memory"], "state_conditioning": True},
+    "predict_post":        {"sources": ["working_memory"], "state_conditioning": True},
+    "encode_expectation":  {"sources": ["raw_conversation"], "state_conditioning": True},
+    "encode_memory":       {"sources": ["current_message"], "state_conditioning": False},
+}
+
+PIPELINE_SOURCES = [
+    {"id": "raw_conversation", "label": "Raw Conversation", "desc": "Actual chat turns"},
+    {"id": "encoded_inputs",   "label": "Encoded Inputs",   "desc": "LLM-recorded user memories"},
+    {"id": "encoded_outputs",  "label": "Encoded Outputs",  "desc": "LLM-recorded assistant memories"},
+    {"id": "lt_memories",      "label": "LT Memories",      "desc": "Retrieved long-term memories"},
+    {"id": "working_memory",   "label": "Working Memory",   "desc": "Compressed WM summary"},
+    {"id": "current_message",  "label": "Current Message",  "desc": "Current user input"},
+]
+
 # ── Pure Math Helpers ──
 
 def ts() -> str: return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-def initial_latent() -> dict: return {"surprise": 0.30, "valence": 0.00, "velocity": 0.30}
+def initial_latent() -> dict:
+    """Starting latent state: moderate surprise, neutral valence, moderate velocity."""
+    return {"surprise": 0.30, "valence": 0.00, "velocity": 0.30}
 
 def _state_conditioning_simple(latent: dict) -> str:
     """Minimal state conditioning for internal brain.py modules."""
@@ -243,6 +274,7 @@ def classify_terminal_state(latent: dict) -> str:
     return "default_mode"
 
 def efe_distance(state: dict, preferred: dict) -> float:
+    """Euclidean distance in latent space between current state and preferred state."""
     return round(sum((state.get(k, 0) - preferred.get(k, 0)) ** 2 for k in preferred) ** 0.5, 4)
 
 def _cosim(a: list, b: list) -> float:
@@ -250,6 +282,7 @@ def _cosim(a: list, b: list) -> float:
     return max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b))))
 
 def idle_phase(seconds: int) -> dict:
+    """Return the current idle phase based on elapsed seconds since last user input."""
     phase = IDLE_PHASES[0]
     for p in IDLE_PHASES:
         if seconds >= p["threshold"]: phase = p
@@ -355,19 +388,117 @@ class BayesianBrain:
         # ── Diagnostic ──
         self._diag: CycleDiagnostic = CycleDiagnostic()
         self._diag_cycle: int = 0
+        # ── Pipeline Configuration (modifiable via UI) ──
+        self._pipeline_config: dict = json.loads(json.dumps(DEFAULT_PIPELINE_CONFIG))
+        self._cycle_data: dict = {}
 
     def _init_prototypes(self) -> list:
         """Initialize prototypes evenly distributed across latent space."""
         protos = []
         for i in range(self.N_PROTOTYPES):
-            s = (i % 4) / 3.0  # 0.0, 0.33, 0.67, 1.0
-            v = -0.5 + (i % 3) * 0.5  # -0.5, 0.0, 0.5
-            vel = 0.2 + (i % 2) * 0.5  # 0.2, 0.7
+            s = (i % 4) / 3.0
+            v = -0.5 + (i % 3) * 0.5
+            vel = 0.2 + (i % 2) * 0.5
             protos.append([round(s, 2), round(v, 2), round(vel, 2)])
         return protos
 
+    # ── Pipeline Configuration ──
+
+    @property
+    def pipeline_config(self) -> dict:
+        """Current pipeline wiring config. Serializable to JSON for UI."""
+        return self._pipeline_config
+
+    def update_pipeline_config(self, new_config: dict):
+        """Update pipeline config from UI. Empty config resets to defaults."""
+        if not new_config:
+            self._pipeline_config = json.loads(json.dumps(DEFAULT_PIPELINE_CONFIG))
+            return
+        for key in DEFAULT_PIPELINE_CONFIG:
+            if key in new_config:
+                self._pipeline_config[key] = new_config[key]
+
+    def _get_stage_config(self, stage: str) -> dict:
+        return self._pipeline_config.get(stage, DEFAULT_PIPELINE_CONFIG.get(stage, {"sources": [], "state_conditioning": False}))
+
+    def resolve_context(self, stage: str) -> list:
+        """Resolve data sources for a pipeline stage into [{role, content}] messages.
+        
+        Items with _order metadata (from encoded_inputs/outputs) are merged
+        and sorted chronologically, producing interleaved User/Assistant turns.
+        Items without _order keep their relative position after ordered items.
+        """
+        sources = self._get_stage_config(stage).get("sources", [])
+        ordered = []   # items with _order → will be sorted
+        unordered = [] # items without → appended after
+        
+        for src in sources:
+            data = self._cycle_data.get(src)
+            if data is None:
+                continue
+            if isinstance(data, str):
+                if data.strip():
+                    unordered.append({"role": "user", "content": data})
+            elif isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("content", "").strip():
+                        if "_order" in item:
+                            ordered.append(item)
+                        else:
+                            unordered.append(item)
+                    elif isinstance(item, str) and item.strip():
+                        unordered.append({"role": "user", "content": item})
+        
+        # Sort ordered items chronologically then merge
+        ordered.sort(key=lambda x: x.get("_order", 0))
+        
+        # Strip _order metadata before returning
+        result = []
+        for item in ordered + unordered:
+            result.append({"role": item.get("role", "user"), "content": item["content"]})
+        return result
+
+    def stage_uses_state(self, stage: str) -> bool:
+        """Check if a pipeline stage should include latent state conditioning."""
+        return self._get_stage_config(stage).get("state_conditioning", False)
+
+    async def _get_recent_encoded_memories(self, vectors, n: int = 10, mode: str = "both") -> list:
+        """Get recent encoded memories from ChromaDB by type. Returns [{role, content}].
+        mode: 'input', 'output', or 'both'. Turn count scales with surprise."""
+        if not vectors or not hasattr(vectors, '_episodic_col') or not vectors._episodic_col:
+            return []
+        try:
+            count = vectors._episodic_col.count()
+            if count == 0:
+                return []
+            results = vectors._episodic_col.get(
+                include=["documents", "metadatas"], limit=min(n * 2, count))
+            if not results or not results.get("documents"):
+                return []
+            entries = []
+            for doc, meta in zip(results["documents"], results["metadatas"]):
+                mem_type = meta.get("memory_type", "input")
+                if mode == "input" and mem_type != "input":
+                    continue
+                if mode == "output" and mem_type != "output":
+                    continue
+                entries.append({
+                    "role": "user" if mem_type == "input" else "assistant",
+                    "content": doc,
+                    "msg_counter": meta.get("msg_counter", 0),
+                })
+            entries.sort(key=lambda e: e.get("msg_counter", 0))
+            s = self.latent.get("surprise", 0.3)
+            max_turns = max(3, min(n, int(4 + s * 8)))
+            entries = entries[-max_turns:]
+            return [{"role": e["role"], "content": e["content"], "_order": e.get("msg_counter", 0)} for e in entries]
+        except Exception as e:
+            logger.debug(f"Encoded memory retrieval failed: {e}")
+            return []
+
     @property
     def rolling_error(self) -> float:
+        """Exponentially-weighted recent prediction error. Recency-biased: recent errors matter more."""
         if not self._error_history: return 0.5
         weights = [0.5 ** i for i in range(len(self._error_history))]
         return round(sum(e * w for e, w in zip(list(reversed(self._error_history)), weights)) / sum(weights), 4)
@@ -383,10 +514,12 @@ class BayesianBrain:
         return "engaged"
 
     def state_summary(self) -> str:
+        """One-line human-readable state label + numeric values."""
         s, v, vel = self.latent["surprise"], self.latent["valence"], self.latent["velocity"]
         return f"{self._latent_label()} — surprise={s:.2f} valence={v:+.2f} velocity={vel:.2f}"
 
     def state_snapshot(self) -> dict:
+        """Full state dump for frontend WebSocket broadcast. Includes everything the UI needs."""
         phase = idle_phase(self.idle_seconds)
         next_in = max(0, ACTION_THRESHOLD_S - self.idle_seconds) if self.action_count == 0 else max(0, ACTION_REPEAT_S - self.idle_seconds)
         enriched_summary = {}
@@ -433,6 +566,7 @@ class BayesianBrain:
         }
 
     def reset_idle(self):
+        """Reset idle timers on user input. Captures terminal state before reset for allostatic analysis."""
         # ── Capture terminal state before reset (Critique 7) ──
         self._terminal_state = classify_terminal_state(self.latent)
         self._terminal_valence = self.latent["valence"]
@@ -441,6 +575,8 @@ class BayesianBrain:
         self.idle_seconds = 0; self.idle_fe = 0.0
 
     async def restore_from_memory(self, memory) -> bool:
+        """Restore brain state from SQLite on startup. Loads latent state, conversation history,
+        covariance, phenotype prior, EMAs, and all extended state from previous sessions."""
         try:
             state = await memory.load_brain_state()
             if state:
@@ -485,6 +621,9 @@ class BayesianBrain:
                 self._output_context_usage = ext.get("output_context_usage", 0.0)
                 self._deliberation_gain_ema = ext.get("deliberation_gain_ema", 0.0)
                 self._sim_accuracy_ema = ext.get("sim_accuracy_ema", 0.5)
+                if ext.get("pipeline_config_json"):
+                    try: self._pipeline_config = ext["pipeline_config_json"]
+                    except Exception: pass
             return True
         except Exception as e: logger.error(f"State restore failed: {e}")
         return False
@@ -512,6 +651,7 @@ class BayesianBrain:
                 "output_context_usage": self._output_context_usage,
                 "deliberation_gain_ema": self._deliberation_gain_ema,
                 "sim_accuracy_ema": self._sim_accuracy_ema,
+                "pipeline_config": self._pipeline_config,
             })
         except Exception: pass
 
@@ -727,7 +867,7 @@ class BayesianBrain:
                 else:
                     compressed_text = text
             
-            context.append({"role": role, "content": compressed_text})
+            context.append({"role": role, "content": compressed_text, "_order": ep.get("msg_counter", 0)})
             
             mc = ep.get("msg_counter", 0)
             gap = (mc - prev_counter) if prev_counter is not None else 0
@@ -920,6 +1060,8 @@ class BayesianBrain:
     # ── Internal Action EFE (pure physics) ──
 
     def start_idle_loop(self, llm, memory, broadcast, vectors=None):
+        """Start the Default Mode Network (idle loop). Runs Langevin dynamics,
+        dream synthesis, memory compression, and attractor analysis when no user input."""
         self._idle_task = asyncio.create_task(self._idle_loop(llm, memory, broadcast, vectors))
 
     async def _dream_synthesis(self, vectors, llm, memory, broadcast):
@@ -1686,38 +1828,50 @@ class BayesianBrain:
                 msg_vec, new_latent, vectors, broadcast, n=8, 
                 boredom=boredom, adapt=adapt)
             
-            # ── Working Memory Compression ──
+            # ── Populate cycle data sources for pipeline resolver ──
+            encoded_inputs = await self._get_recent_encoded_memories(vectors, n=10, mode="input")
+            encoded_outputs = await self._get_recent_encoded_memories(vectors, n=10, mode="output")
+            
+            # Tag raw conversation with _order for chronological interleaving
+            raw_conv_ordered = []
+            base_counter = max(0, self._msg_counter - len(self.conversation[-12:]))
+            for i, m in enumerate(self.conversation[-12:]):
+                raw_conv_ordered.append({
+                    "role": m.get("role", "user"), 
+                    "content": m.get("content", ""),
+                    "_order": base_counter + i
+                })
+            
+            self._cycle_data = {
+                "raw_conversation": raw_conv_ordered,
+                "current_message": user_text,
+                "encoded_inputs": encoded_inputs,
+                "encoded_outputs": encoded_outputs,
+                "lt_memories": lt_context,
+            }
+            
+            # ── Working Memory Compression (sources from pipeline config) ──
             s = new_latent.get("surprise", 0.3)
             wm_budget = max(40, min(150, int(60 + s * 120)))
-            
+            wm_sources = self.resolve_context("working_memory")
             wm_text = await llm.compress_working_memory(
-                self.conversation, new_latent, 
-                long_term_context=lt_context, word_budget=wm_budget)
+                wm_sources, new_latent, word_budget=wm_budget,
+                state_conditioning=self.stage_uses_state("working_memory"))
+            self._cycle_data["working_memory"] = wm_text
             
-            # ── Assemble context: WM text + LT memories → all as user messages ──
-            _mc = []
-            if wm_text:
-                _mc.append({"role": "user", "content": wm_text})
-            for m in lt_context:
-                # Avoid duplicating content already in WM
-                if m.get("content", "")[:50] not in wm_text[:500] if wm_text else True:
-                    _mc.append(m)
+            # ── Assemble output context from pipeline config ──
+            _mc = self.resolve_context("output")
             
             # ── Active Inference (DMN continuation) ──
-            # All thresholds are adaptive — computed from system state via _adaptive_thresholds()
             active_inference = False
             if boredom > 0.0 and len(_mc) >= 2:
                 last = _mc[-1]
                 last_words = len(last.get("content", "").split())
                 brevity_ratio = last_words / max(self._user_word_ema, 1)
-                
-                # Adaptive: short_msg_ratio depends on conversation baseline length
                 if last.get("role") == "user" and brevity_ratio < adapt["short_msg_ratio"]:
                     penultimate = _mc[-2]
                     pen_words = len(penultimate.get("content", "").split())
-                    
                     if penultimate.get("role") == "assistant" and pen_words > last_words * 3:
-                        # Adaptive threshold from system state
                         if boredom > adapt["active_inference_threshold"]:
                             _mc = _mc[:-1]
                             active_inference = True
@@ -1725,7 +1879,7 @@ class BayesianBrain:
             if active_inference:
                 await broadcast({
                     "type": "system_trace", "label": "active_inference", "duration_ms": 0,
-                    "summary": f"ACTIVE INFERENCE: boredom={boredom:.2f} > threshold={adapt['active_inference_threshold']:.2f} (fatigue={adapt['fatigue']:.2f} novelty={adapt['novelty']:.2f})",
+                    "summary": f"ACTIVE INFERENCE: boredom={boredom:.2f} > threshold={adapt['active_inference_threshold']:.2f}",
                     "details": {"boredom": boredom, "rep_boredom": round(rep_boredom, 3),
                                 "brev_boredom": round(brev_boredom, 3), "nov_boredom": round(nov_boredom, 3),
                                 "adaptive": adapt, "context_len": len(_mc)}
@@ -1734,7 +1888,10 @@ class BayesianBrain:
             self._diag.set_memory_context(_mc)
 
             # ── 11. PRE-ACTION TRAJECTORY ──
-            pre_action_pred = await llm.predict_trajectory(_mc, new_latent, user_model=vectors.get_user_model() if vectors else {})
+            predict_context = self.resolve_context("predict_pre")
+            pre_action_pred = await llm.predict_trajectory(
+                predict_context, new_latent, user_model=vectors.get_user_model() if vectors else {},
+                state_conditioning=self.stage_uses_state("predict_pre"))
             vec_pre = await vectors.embed(pre_action_pred) if vectors else None
             self._predicted_hyp_vec = vec_pre
             self._predicted_hyp_text = pre_action_pred
@@ -1749,6 +1906,7 @@ class BayesianBrain:
                 topic_summary=self.topic_summary, 
                 feedback=feedback,
                 user_model=vectors.get_user_model() if vectors else {},
+                state_conditioning=self.stage_uses_state("output"),
             )
 
             # ── 12a. ENCODE OUTPUT MEMORY ──────────
@@ -1791,7 +1949,10 @@ class BayesianBrain:
 
             # ── 12b. POST-ACTION TRAJECTORY & CAUSAL IMPACT ──
             reply_for_prediction = output_memory if output_memory else reply
-            prediction_text = await llm.predicted_input_module(_mc, new_latent, reply_for_prediction, user_model=vectors.get_user_model() if vectors else {})
+            prediction_text = await llm.predicted_input_module(
+                self.resolve_context("predict_post"), new_latent, reply_for_prediction,
+                user_model=vectors.get_user_model() if vectors else {},
+                state_conditioning=self.stage_uses_state("predict_post"))
             if prediction_text: 
                 self.current_prediction = prediction_text
                 vec_post = await vectors.embed(prediction_text) if vectors else None

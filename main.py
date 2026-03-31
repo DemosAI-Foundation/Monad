@@ -21,7 +21,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 
-from brain import BayesianBrain
+from brain import BayesianBrain, PIPELINE_SOURCES, DEFAULT_PIPELINE_CONFIG
 from memory import Memory
 from llm import LLMClient
 from embeddings import EmbeddingStore
@@ -72,7 +72,7 @@ async def root(): return FileResponse("static/index.html")
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await hub.connect(ws)
-    await ws.send_text(json.dumps({"type": "init", "data": brain.state_snapshot(), "messages": brain.messages, "llm_endpoint": llm.endpoint, "connected": await llm.test_connection()}))
+    await ws.send_text(json.dumps({"type": "init", "data": brain.state_snapshot(), "messages": brain.messages, "llm_endpoint": llm.endpoint, "connected": await llm.test_connection(), "pipeline_config": brain.pipeline_config, "pipeline_sources": PIPELINE_SOURCES}))
     try:
         while True:
             raw  = await ws.receive_text()
@@ -82,6 +82,9 @@ async def websocket_endpoint(ws: WebSocket):
                 llm.endpoint = data["endpoint"].rstrip("/")
                 connected    = await llm.test_connection()
                 await hub.broadcast({"type": "endpoint_status", "endpoint": llm.endpoint, "connected": connected})
+            elif data["type"] == "update_pipeline_config":
+                brain.update_pipeline_config(data.get("config", {}))
+                await hub.broadcast({"type": "pipeline_config", "config": brain.pipeline_config, "sources": PIPELINE_SOURCES})
     except WebSocketDisconnect: hub.disconnect(ws)
 
 @app.get("/api/memory/predictions")
@@ -99,6 +102,15 @@ async def get_vector_stats():
     try:
         return JSONResponse({"messages": vectors._messages_col.count() if vectors._messages_col else 0, "concepts": vectors._concepts_col.count() if vectors._concepts_col else 0, "model": vectors._embed_model_name, "adaptive_threshold": round(vectors._sim_stats.threshold(), 3), "sim_stats": {"n": vectors._sim_stats.n, "mean": round(vectors._sim_stats._mean, 3), "std": round(vectors._sim_stats.std, 3)}})
     except Exception as e: return JSONResponse({"error": str(e)})
+
+@app.get("/api/pipeline/config")
+async def get_pipeline_config():
+    return JSONResponse({"config": brain.pipeline_config, "sources": PIPELINE_SOURCES, "defaults": DEFAULT_PIPELINE_CONFIG})
+
+@app.put("/api/pipeline/config")
+async def put_pipeline_config():
+    """Update via WebSocket instead (type: update_pipeline_config). REST kept for debugging."""
+    return JSONResponse({"config": brain.pipeline_config, "note": "Use WebSocket update_pipeline_config for live updates"})
 
 @app.get("/api/debug/perplexity")
 async def debug_perplexity():

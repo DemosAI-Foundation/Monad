@@ -132,9 +132,11 @@ INTENT_ANCHORS = {
 }
 
 class RunningStats:
+    """Online mean/variance tracker for adaptive retrieval thresholds (Welford's algorithm)."""
     def __init__(self, min_samples: int = 15, default: float = BASE_RETRIEVAL_THRESH):
         self.n, self._mean, self._M2, self.min_samples, self._default = 0, 0.0, 0.0, min_samples, default
     def update(self, x: float):
+        """Incorporate a new similarity score into running statistics."""
         if x <= 0.0: return
         self.n += 1
         delta = x - self._mean
@@ -176,9 +178,12 @@ def _retrieval_dampener(retrieved: list) -> float: return max(0.70, 1.0 - (sum(r
 EMOTION_VAD = { "joy": (0.88, 0.72), "surprise": (0.08, 0.78), "neutral": (0.00, 0.20), "sadness": (-0.80, 0.18), "disgust": (-0.68, 0.30), "fear": (-0.62, 0.74), "anger": (-0.70, 0.84) }
 
 class VADModel:
+    """Valence-Arousal-Dominance model using distilroberta emotion classification.
+    Maps emotion probabilities to continuous valence/arousal scores via EMOTION_VAD lookup."""
     def __init__(self, model_name: str = VAD_MODEL_NAME):
         self._model_name, self._pipe, self._available = model_name, None, False
     def load(self):
+        """Load the HuggingFace emotion classification pipeline."""
         if not _TRANSFORMERS_AVAILABLE: return
         try:
             self._pipe = hf_pipeline("text-classification", model=self._model_name, top_k=None, truncation=True, max_length=128)
@@ -187,6 +192,7 @@ class VADModel:
             logger.warning(f"VAD model failed ({e}) — using anchor fallback.")
             self._available = False
     def score(self, text: str):
+        """Score text → (valence, arousal) or None if model unavailable."""
         if not self._available or self._pipe is None: return None
         try:
             results = self._pipe(text[:512])
@@ -260,6 +266,7 @@ class EmbeddingStore:
         return { "cognitive_load": round(cognitive_load, 3), "complexity_score": round(complexity_score, 3), "reading_time_s": expected_reading_time, "delay_s": expected_delay_s }
 
     async def init(self):
+        """Initialize embedding model, VAD model, ChromaDB collections, and classifiers."""
         loop = asyncio.get_event_loop()
         self._model = await loop.run_in_executor(None, lambda: SentenceTransformer(self._embed_model_name))
         await loop.run_in_executor(None, self._vad_model.load)
@@ -326,9 +333,12 @@ class EmbeddingStore:
         return await asyncio.get_event_loop().run_in_executor(None, sync_search)
 
     async def embed(self, text: str) -> list:
+        """Encode text → 384d normalized embedding vector via sentence-transformers."""
         return await asyncio.get_event_loop().run_in_executor(None, lambda: self._model.encode(text, normalize_embeddings=True).tolist())
 
     def semantic_velocity(self, new_vec: list) -> float:
+        """Measure rate of semantic change over recent embeddings (sliding window of 6).
+        High velocity = topic shifts / new information. Low = repetition / deepening."""
         window = list(self._embed_window)
         if len(window) < 2:
             self._embed_window.append(new_vec)
@@ -367,6 +377,7 @@ class EmbeddingStore:
         return {"label": label, "best_score": round(best_score, 3), "breakdown": {k: round(v, 3) for k, v in sorted_scores}}
 
     async def store_belief(self, belief_text: str):
+        """Store a core belief in the beliefs collection (deduplicated by content hash)."""
         vec = await self.embed(belief_text)
         b_id = hashlib.md5(belief_text.encode()).hexdigest()
         try: self._beliefs_col.upsert(ids=[b_id], embeddings=[vec], documents=[belief_text])
@@ -906,6 +917,7 @@ class EmbeddingStore:
         return selected
 
     async def store_message(self, message_id: str, text: str, vector: list, role: str, latent: dict, enriched: dict, encoding_strength: float = 0.5):
+        """Store a conversation message in the messages ChromaDB collection with full metadata."""
         tone, concepts = enriched.get("tone", {}), enriched.get("concepts", [])
         metadata = {
             "ts": enriched.get("ts",""), "role": role, "latent_json": json.dumps(latent),
@@ -1001,6 +1013,9 @@ class EmbeddingStore:
         return round(min(1.0, (1.0 - _cosim(candidate_vec, centroid)) / 0.5), 4)
 
     async def encode_message(self, text: str, latent: Optional[dict] = None, covariance: list = None) -> dict:
+        """Full perceptual encoding of a user message. Returns enriched dict with:
+        vector, velocity, tone (valence/arousal), intent, concepts, beliefs,
+        prediction_error, and epistemic drive. This is step 1 of the pipeline."""
         if latent is None: latent = {"surprise": 0.3, "valence": 0.0, "velocity": 0.3}
 
         vec = await self.embed(text)

@@ -272,6 +272,41 @@ input { font-family: var(--font-mono); }
 #json-count { font-size:9px; color:var(--text-deep); }
 .json-filter-btn { font-size:8px; letter-spacing:1.5px; padding:3px 9px; border:1px solid var(--border2); border-radius:2px; background:none; color:var(--text-far); transition:all .2s; }
 .json-filter-btn.active { background:var(--bg3); color:var(--text); border-color:var(--text-off); }
+.pipe-source {
+  display:inline-block; padding:4px 10px; font-size:8px; letter-spacing:1px;
+  border:1px solid var(--border2); border-radius:3px; cursor:grab;
+  color:var(--text-off); background:var(--bg2); transition:all .2s; user-select:none;
+}
+.pipe-source:hover { border-color:var(--exploration); color:var(--text); }
+.pipe-source.dragging { opacity:0.4; }
+.pipe-stage {
+  margin-bottom:12px; border:1px solid var(--border2); border-radius:4px;
+  background:var(--bg1); overflow:hidden;
+}
+.pipe-stage-head {
+  display:flex; align-items:center; justify-content:space-between;
+  padding:8px 12px; background:var(--bg2); border-bottom:1px solid var(--border2);
+}
+.pipe-stage-name { font-size:9px; letter-spacing:1.5px; color:var(--text); }
+.pipe-stage-toggle {
+  font-size:8px; padding:2px 8px; border:1px solid var(--border2); border-radius:2px;
+  background:none; color:var(--text-far); cursor:pointer; transition:all .2s;
+}
+.pipe-stage-toggle.active { background:#2a3a20; color:#4ade80; border-color:#2a3a20; }
+.pipe-dropzone {
+  min-height:36px; padding:6px 10px; display:flex; flex-wrap:wrap; gap:5px;
+  transition:background .2s;
+}
+.pipe-dropzone.drag-over { background:var(--bg3); }
+.pipe-chip {
+  display:inline-flex; align-items:center; gap:4px; padding:3px 8px;
+  font-size:8px; letter-spacing:1px; border-radius:3px;
+  border:1px solid var(--exploration); color:var(--exploration); background:var(--bg2);
+}
+.pipe-chip .pipe-remove {
+  cursor:pointer; opacity:0.5; font-size:10px; line-height:1;
+}
+.pipe-chip .pipe-remove:hover { opacity:1; color:#ff3b5c; }
 </style>
 </head>
 <body>
@@ -378,6 +413,7 @@ input { font-family: var(--font-mono); }
       <button class="tab-btn" data-tab="vectors">VECTORS</button>
       <button class="tab-btn" data-tab="trace" id="trace-tab-btn">TRACE</button>
       <button class="tab-btn" data-tab="json" id="json-tab-btn">JSON</button>
+      <button class="tab-btn" data-tab="pipeline">PIPELINE</button>
       <button class="tab-btn" data-tab="arch">ARCH</button>
     </div>
 
@@ -511,6 +547,20 @@ input { font-family: var(--font-mono); }
         <div id="json-list" class="tab-content" style="overflow-y:auto"></div>
       </div>
 
+      <!-- PIPELINE -->
+      <div id="panel-pipeline" class="panel" style="display:none;padding:12px 16px;overflow-y:auto">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div class="p-title" style="margin:0">PIPELINE CONFIGURATION</div>
+          <button id="pipeline-reset-btn" style="font-size:8px;letter-spacing:1.5px;padding:3px 10px;border:1px solid var(--border2);border-radius:2px;background:none;color:var(--text-far);cursor:pointer">RESET DEFAULTS</button>
+        </div>
+        <div style="font-size:9px;color:var(--text-far);margin-bottom:14px;line-height:1.5">
+          Drag sources into pipeline stages to configure what data each function sees. Toggle ⚡ for state conditioning (injects latent values into system prompt).
+        </div>
+        <div style="font-size:8px;letter-spacing:1.5px;color:var(--text-off);margin-bottom:6px">AVAILABLE SOURCES</div>
+        <div id="pipeline-sources" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px;padding:8px;background:var(--bg1);border:1px dashed var(--border2);border-radius:4px"></div>
+        <div id="pipeline-stages"></div>
+      </div>
+
       <!-- ARCH -->
       <div id="panel-arch" class="panel" style="display:none">
         <div class="p-title">SYSTEM ARCHITECTURE — v0.91 Continuous Generative</div>
@@ -555,6 +605,7 @@ function handleMessage(msg) {
       document.getElementById("endpoint-input").value = msg.llm_endpoint || "";
       msg.messages.forEach(m => appendMessage(m));
       updateState(msg.data);
+      if (msg.pipeline_config) { pipelineConfig = msg.pipeline_config; pipelineSources = msg.pipeline_sources || []; }
       break;
     case "idle_tick": updateState(msg.data); break;
     case "user_message": appendMessage(msg.message); break;
@@ -564,8 +615,12 @@ function handleMessage(msg) {
       appendMessage(msg.message); updateState(msg.data); updateErrorBar({ error: msg.message.error, type:"temporal", explanation:"silence-triggered", isSilence:true }); actionCount = msg.data.action_count; refreshBadge("silence"); refreshActiveTab(); break;
     case "processing": setProcessing(msg.value); break;
     case "endpoint_status": setEndpointStatus(msg.connected, msg.endpoint); break;
+    case "pipeline_config":
+      if (msg.config) { pipelineConfig = msg.config; if (msg.sources) pipelineSources = msg.sources; }
+      if (document.querySelector(".tab-btn.active")?.dataset.tab === "pipeline") renderPipeline();
+      break;
     case "llm_trace": 
-    case "system_trace": // New! Deep Telemetry handling
+    case "system_trace":
       ingestTrace(msg); break;
     case "error": appendMessage({ role:"system", content:`⚠ ${msg.message}`, ts:now(), error:null, origin:"system" }); break;
   }
@@ -808,7 +863,7 @@ document.getElementById("trace-copy-btn").addEventListener("click", () => {
 
 async function fetchAndRender(tab) {
   try {
-    switch (tab) { case "predictions": await renderPredictions(); break; case "errors": await renderErrors(); break; case "silence": await renderSilence(); break; case "priors": await renderPriors(); break; case "vectors": await renderVectors(); break; case "trace": renderAllTraces(); break; case "json": renderAllJson(); break; }
+    switch (tab) { case "predictions": await renderPredictions(); break; case "errors": await renderErrors(); break; case "silence": await renderSilence(); break; case "priors": await renderPriors(); break; case "vectors": await renderVectors(); break; case "trace": renderAllTraces(); break; case "json": renderAllJson(); break; case "pipeline": renderPipeline(); break; }
   } catch(e) { console.error("Tab render error:", e); }
 }
 
@@ -864,7 +919,7 @@ function refreshBadge(tabName) {
 
 function refreshActiveTab() { const active = document.querySelector(".tab-btn.active"); if (active) fetchAndRender(active.dataset.tab); }
 
-const PANELS = { beliefs:"panel-beliefs", predictions:"panel-predictions", errors:"panel-errors", silence:"panel-silence", priors:"panel-priors", vectors:"panel-vectors", trace:"panel-trace", json:"panel-json", arch:"panel-arch" };
+const PANELS = { beliefs:"panel-beliefs", predictions:"panel-predictions", errors:"panel-errors", silence:"panel-silence", priors:"panel-priors", vectors:"panel-vectors", trace:"panel-trace", json:"panel-json", pipeline:"panel-pipeline", arch:"panel-arch" };
 document.querySelectorAll(".tab-btn").forEach(btn => {
   btn.addEventListener("click", () => {
     document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active")); btn.classList.add("active");
@@ -1011,6 +1066,120 @@ document.getElementById("json-copy-btn").addEventListener("click", () => {
     const btn = document.getElementById("json-copy-btn");
     btn.textContent = "COPIED ✓"; setTimeout(() => btn.textContent = "COPY ALL", 1500);
   });
+});
+
+// ── Pipeline Configuration UI ──
+let pipelineConfig = {};
+let pipelineSources = [];
+const STAGE_LABELS = {
+  working_memory: "Working Memory Compression",
+  output: "Output Generation",
+  hypothetical: "Hypothetical Reply",
+  predict_pre: "Pre-Action Prediction",
+  predict_post: "Post-Action Prediction",
+  encode_expectation: "Expectation Encoding",
+  encode_memory: "Memory Encoding",
+};
+
+function renderPipeline() {
+  const srcContainer = document.getElementById("pipeline-sources");
+  const stagesContainer = document.getElementById("pipeline-stages");
+  if (!srcContainer || !stagesContainer) return;
+
+  // Render draggable source badges
+  srcContainer.innerHTML = "";
+  pipelineSources.forEach(src => {
+    const badge = document.createElement("div");
+    badge.className = "pipe-source";
+    badge.draggable = true;
+    badge.dataset.sourceId = src.id;
+    badge.textContent = src.label;
+    badge.title = src.desc;
+    badge.addEventListener("dragstart", e => {
+      e.dataTransfer.setData("text/plain", src.id);
+      badge.classList.add("dragging");
+    });
+    badge.addEventListener("dragend", () => badge.classList.remove("dragging"));
+    srcContainer.appendChild(badge);
+  });
+
+  // Render stages
+  stagesContainer.innerHTML = "";
+  for (const [stageId, stageConf] of Object.entries(pipelineConfig)) {
+    const stage = document.createElement("div");
+    stage.className = "pipe-stage";
+
+    const scActive = stageConf.state_conditioning;
+    stage.innerHTML = `
+      <div class="pipe-stage-head">
+        <div class="pipe-stage-name">${(STAGE_LABELS[stageId] || stageId).toUpperCase()}</div>
+        <button class="pipe-stage-toggle ${scActive ? 'active' : ''}" data-stage="${stageId}" title="State conditioning: inject latent values into system prompt">
+          ⚡ ${scActive ? 'ON' : 'OFF'}
+        </button>
+      </div>
+      <div class="pipe-dropzone" data-stage="${stageId}"></div>`;
+
+    const dropzone = stage.querySelector(".pipe-dropzone");
+
+    // Render existing chips
+    (stageConf.sources || []).forEach(srcId => {
+      dropzone.appendChild(createChip(srcId, stageId));
+    });
+
+    // Drag-and-drop handlers
+    dropzone.addEventListener("dragover", e => { e.preventDefault(); dropzone.classList.add("drag-over"); });
+    dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag-over"));
+    dropzone.addEventListener("drop", e => {
+      e.preventDefault();
+      dropzone.classList.remove("drag-over");
+      const srcId = e.dataTransfer.getData("text/plain");
+      if (!srcId) return;
+      // Don't add duplicates
+      const existing = pipelineConfig[stageId]?.sources || [];
+      if (existing.includes(srcId)) return;
+      existing.push(srcId);
+      pipelineConfig[stageId].sources = existing;
+      dropzone.appendChild(createChip(srcId, stageId));
+      sendPipelineUpdate();
+    });
+
+    // State conditioning toggle
+    stage.querySelector(".pipe-stage-toggle").addEventListener("click", function() {
+      const active = !pipelineConfig[stageId].state_conditioning;
+      pipelineConfig[stageId].state_conditioning = active;
+      this.classList.toggle("active", active);
+      this.textContent = `⚡ ${active ? 'ON' : 'OFF'}`;
+      sendPipelineUpdate();
+    });
+
+    stagesContainer.appendChild(stage);
+  }
+}
+
+function createChip(srcId, stageId) {
+  const label = pipelineSources.find(s => s.id === srcId)?.label || srcId;
+  const chip = document.createElement("div");
+  chip.className = "pipe-chip";
+  chip.innerHTML = `${label} <span class="pipe-remove" title="Remove">×</span>`;
+  chip.querySelector(".pipe-remove").addEventListener("click", () => {
+    const sources = pipelineConfig[stageId]?.sources || [];
+    pipelineConfig[stageId].sources = sources.filter(s => s !== srcId);
+    chip.remove();
+    sendPipelineUpdate();
+  });
+  return chip;
+}
+
+function sendPipelineUpdate() {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "update_pipeline_config", config: pipelineConfig }));
+  }
+}
+
+document.getElementById("pipeline-reset-btn")?.addEventListener("click", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "update_pipeline_config", config: {} }));
+  }
 });
 
 connect();
